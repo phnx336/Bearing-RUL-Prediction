@@ -1,0 +1,139 @@
+
+import os
+import re
+import numpy as np
+import pandas as pd
+from scipy.stats import kurtosis, skew
+from scipy.fft import fft
+RAW_ROOT = r"A:\Coding\Bearing-RUL-Prediction\data\RAW\XJTU-SY"
+OUTPUT_CSV = r"A:\Coding\Bearing-RUL-Prediction\data\PROCESSED\xjtu_sy_features.csv"
+os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+SAMPLING_RATE = 25600 
+FNAME_PATTERN = re.compile(
+    r"^(?P<var>[xy])"
+    r"(?P<split>tr|te)"
+    r"(?P<condition>\d)"
+    r"_(?P<bearing>b?\d+)"
+    r"\.npy$",
+    re.IGNORECASE,
+)
+
+def parse_filename(fname: str) -> dict | None:
+    match = FNAME_PATTERN.match(fname)
+    if not match:
+        return None
+    g = match.groupdict()
+    return {
+        "variable": "X" if g["var"].lower() == "x" else "y",
+        "split": "train" if g["split"].lower() == "tr" else "test",
+        "condition": int(g["condition"]),
+        "bearing": g["bearing"],
+    }
+
+
+def build_file_index(raw_root: str) -> pd.DataFrame:
+    rows = []
+    for fname in sorted(os.listdir(raw_root)):
+        if not fname.lower().endswith(".npy"):
+            continue
+        parsed = parse_filename(fname)
+        if parsed is None:
+            print(f"Skipping unrecognized file: {fname}")
+            continue
+        rows.append({"filename": fname, "filepath": os.path.join(raw_root, fname), **parsed})
+    return pd.DataFrame(rows)
+
+
+def extract_features(signal: np.ndarray) -> dict:
+    feats = {}
+    feats["mean"] = np.mean(signal)
+    feats["std"] = np.std(signal)
+    feats["rms"] = np.sqrt(np.mean(signal ** 2))
+    feats["peak"] = np.max(np.abs(signal))
+    feats["skewness"] = skew(signal)
+    feats["kurtosis"] = kurtosis(signal)
+    feats["crest_factor"] = feats["peak"] / (feats["rms"] + 1e-12)
+    feats["shape_factor"] = feats["rms"] / (np.mean(np.abs(signal)) + 1e-12)
+    feats["impulse_factor"] = feats["peak"] / (np.mean(np.abs(signal)) + 1e-12)
+    feats["peak_to_peak"] = np.max(signal) - np.min(signal)
+
+    spectrum = np.abs(fft(signal))
+    spectrum = spectrum[: len(spectrum) // 2]
+    freqs = np.fft.fftfreq(len(signal), d=1 / SAMPLING_RATE)[: len(signal) // 2]
+
+    feats["freq_mean"] = np.mean(spectrum)
+    feats["freq_std"] = np.std(spectrum)
+    feats["freq_peak"] = freqs[np.argmax(spectrum)] if len(spectrum) else 0
+    feats["spectral_energy"] = np.sum(spectrum ** 2)
+    return feats
+
+
+def process_bearing_file(x_path: str, y_path: str | None) -> pd.DataFrame:
+    X = np.load(x_path, allow_pickle=True)   # shape: (n_snapshots, 32768, 2)
+    n_snapshots = X.shape[0]
+
+    y = None
+    if y_path is not None and os.path.exists(y_path):
+        y = np.load(y_path, allow_pickle=True).reshape(-1)  # flatten (n,1) -> (n,)
+
+    rows = []
+    for idx in range(n_snapshots):
+        h_signal = X[idx, :, 0]
+        v_signal = X[idx, :, 1]
+
+        h_feats = {f"h_{k}": v for k, v in extract_features(h_signal).items()}
+        v_feats = {f"v_{k}": v for k, v in extract_features(v_signal).items()}
+
+        if y is not None and idx < len(y):
+            rul_label = y[idx]
+        else:
+            # fallback: linear degradation assumption
+            rul_label = 100.0 * (1 - idx / (n_snapshots - 1)) if n_snapshots > 1 else 0.0
+
+        rows.append({**h_feats, **v_feats, "rul": rul_label, "snapshot_idx": idx})
+
+    return pd.DataFrame(rows)
+
+
+def build_dataset(file_index: pd.DataFrame) -> pd.DataFrame:
+    x_files = file_index[file_index["variable"] == "X"]
+    y_files = file_index[file_index["variable"] == "y"]
+
+    all_rows = []
+    for _, row in x_files.iterrows():
+        match = y_files[
+            (y_files["split"] == row["split"]) &
+            (y_files["condition"] == row["condition"]) &
+            (y_files["bearing"] == row["bearing"])
+        ]
+        y_path = match.iloc[0]["filepath"] if not match.empty else None
+
+        print(f"Processing {row['filename']} "
+              f"(y match: {match.iloc[0]['filename'] if not match.empty else 'NONE, using fallback RUL'})")
+
+        df = process_bearing_file(row["filepath"], y_path)
+        df["split"] = row["split"]
+        df["condition"] = row["condition"]
+        df["bearing"] = row["bearing"]
+        all_rows.append(df)
+
+    return pd.concat(all_rows, ignore_index=True)
+
+
+def main():
+    print(f"Scanning {RAW_ROOT} ...")
+    file_index = build_file_index(RAW_ROOT)
+    print(f"Found {len(file_index)} recognized files "
+          f"({(file_index['variable'] == 'X').sum()} X-files, "
+          f"{(file_index['variable'] == 'y').sum()} y-files)\n")
+
+    dataset = build_dataset(file_index)
+    dataset.to_csv(OUTPUT_CSV, index=False)
+
+    print(f"\nDone. Feature dataset saved to: {OUTPUT_CSV}")
+    print(f"Shape: {dataset.shape}")
+    print(f"Bearings included: {sorted(dataset['bearing'].unique())}")
+    print(f"Split counts:\n{dataset.groupby(['split', 'bearing']).size()}")
+
+if __name__ == "__main__":
+    main()
