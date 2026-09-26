@@ -19,6 +19,7 @@ Frequency domain— freq mean/std/peak, spectral energy
 ## Roadmap
 
 -Currently investigating cause of R² ≈ 1 on test set (suspect: linear RUL labels + monotonic feature trends leaking time info; verify no train/test bearing overlap)
+-Investigating on how to assimilate a bearing which doesn't include itself into any cluster due to drastically different characteristics and/or variance of position compared to other bearings
 -Hyperparameter tuning (grid/random search)
 -Richer features (envelope spectrum, wavelet energy, fault characteristic frequencies)
 -Use `condition` as a model input, not just metadata
@@ -26,3 +27,6 @@ Frequency domain— freq mean/std/peak, spectral energy
 -Compare against other models (SVR, XGBoost, LSTM)
 -Ensemble/switching model: combine multiple models, dynamically weighting or switching between them based on degradation stage, to produce one more accurate RUL curve
 
+Solved Issues:-
+-Solved the R²=1 issue on test set, Cause was consecutive files concatenating previous bearing information with the next bearing information
+-Implemented Cluster Based processing for data and creating train test splits in the clusters themselves in order to Optimize R² values

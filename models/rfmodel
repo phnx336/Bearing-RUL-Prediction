@@ -1,8 +1,15 @@
 """
 train_model.py
 
-Trains a Random Forest on the preprocessed XJTU-SY feature CSV
-(produced by preprocess.py) and evaluates RUL prediction performance.
+Trains a Random Forest on the preprocessed XJTU-SY feature CSV using
+Leave-One-Bearing-Out (LOBO) cross-validation.
+
+Reports:
+  1. Standard LOBO results (one global model)
+  2. A breakdown of LOBO results split by degradation_profile / is_outlier
+  3. Cluster-aware LOBO: trains separate models per k-means degradation
+     cluster, to test whether specializing by bearing "type" improves
+     generalization on bearings that perform poorly under one global model.
 """
 
 import os
@@ -12,35 +19,31 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 
+# -----------------------------
+# CONFIG
+# -----------------------------
 FEATURES_CSV = r"A:\Coding\Bearing-RUL-Prediction\data\PROCESSED\xjtu_sy_features.csv"
-NON_FEATURE_COLS = ["rul", "snapshot_idx", "split", "condition", "bearing"]
+NON_FEATURE_COLS = [
+    "rul", "snapshot_idx", "split", "condition", "bearing", "bearing_uid",
+    "is_outlier", "outlying_metrics", "degradation_profile",
+]
+
+RF_PARAMS = dict(
+    n_estimators=300,
+    max_depth=None,
+    min_samples_leaf=2,
+    n_jobs=-1,
+    random_state=42,
+)
+
 
 def load_data(csv_path: str) -> pd.DataFrame:
     if not os.path.exists(csv_path):
-        raise FileNotFoundError(
-            f"{csv_path} not found. Run preprocess.py first to generate it."
-        )
+        raise FileNotFoundError(f"{csv_path} not found. Run preprocess.py first.")
     return pd.read_csv(csv_path)
 
-def main():
-    print(f"Loading features from {FEATURES_CSV} ...")
-    data = load_data(FEATURES_CSV)
-    print(f"Loaded {len(data)} rows, {data['bearing'].nunique()} bearings.")
 
-    feature_cols = [c for c in data.columns if c not in NON_FEATURE_COLS]
-
-    # Use the split already encoded in the filenames (train/test)
-    train_df = data[data["split"] == "train"]
-    test_df = data[data["split"] == "test"]
-
-    if train_df.empty or test_df.empty:
-        raise ValueError(
-            "Train or test split is empty — check the 'split' column in the CSV."
-        )
-
-    print(f"Train bearings: {sorted(train_df['bearing'].unique())}")
-    print(f"Test bearings:  {sorted(test_df['bearing'].unique())}")
-
+def train_and_eval(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: list) -> dict:
     X_train, y_train = train_df[feature_cols], train_df["rul"]
     X_test, y_test = test_df[feature_cols], test_df["rul"]
 
@@ -48,29 +51,156 @@ def main():
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=None,
-        min_samples_leaf=2,
-        n_jobs=-1,
-        random_state=42,
-    )
+    model = RandomForestRegressor(**RF_PARAMS)
     model.fit(X_train_scaled, y_train)
-
     preds = model.predict(X_test_scaled)
 
-    mae = mean_absolute_error(y_test, preds)
-    rmse = np.sqrt(mean_squared_error(y_test, preds))
-    r2 = r2_score(y_test, preds)
+    return {
+        "mae": mean_absolute_error(y_test, preds),
+        "rmse": np.sqrt(mean_squared_error(y_test, preds)),
+        "r2": r2_score(y_test, preds),
+        "model": model,
+    }
 
-    print("\n--- Evaluation ---")
-    print(f"MAE:  {mae:.3f}")
-    print(f"RMSE: {rmse:.3f}")
-    print(f"R2:   {r2:.3f}")
 
-    importances = pd.Series(model.feature_importances_, index=feature_cols)
-    print("\nTop 10 features by importance:")
+# -----------------------------
+# MODE 1: Standard global LOBO
+# -----------------------------
+def leave_one_bearing_out_cv(data: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
+    bearings = sorted(data["bearing_uid"].unique())
+    results = []
+
+    for held_out in bearings:
+        train_df = data[data["bearing_uid"] != held_out]
+        test_df = data[data["bearing_uid"] == held_out]
+
+        metrics = train_and_eval(train_df, test_df, feature_cols)
+
+        profile = test_df["degradation_profile"].iloc[0]
+        is_outlier = test_df["is_outlier"].iloc[0]
+
+        print(f"[{held_out:10s}] profile={profile:10s} outlier={str(is_outlier):5s} "
+              f"n_test={len(test_df):4d}  MAE={metrics['mae']:6.2f}  "
+              f"RMSE={metrics['rmse']:6.2f}  R2={metrics['r2']:7.4f}")
+
+        results.append({
+            "held_out_bearing": held_out,
+            "degradation_profile": profile,
+            "is_outlier": is_outlier,
+            "n_test_samples": len(test_df),
+            "mae": metrics["mae"],
+            "rmse": metrics["rmse"],
+            "r2": metrics["r2"],
+        })
+
+    return pd.DataFrame(results)
+
+
+# -----------------------------
+# MODE 2: Cluster-aware LOBO (separate model per k-means degradation cluster)
+# -----------------------------
+def cluster_aware_lobo(data: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
+    """
+    For each held-out bearing, trains only on OTHER bearings in the same
+    k-means degradation cluster. Falls back to training on ALL other
+    bearings if the held-out bearing's cluster has no other members (can
+    happen with small clusters on a 10-bearing dataset).
+    """
+    bearings = sorted(data["bearing_uid"].unique())
+    results = []
+
+    for held_out in bearings:
+        held_out_cluster = data.loc[data["bearing_uid"] == held_out, "degradation_profile"].iloc[0]
+
+        same_cluster_mask = (data["degradation_profile"] == held_out_cluster) & (data["bearing_uid"] != held_out)
+        train_df = data[same_cluster_mask]
+        test_df = data[data["bearing_uid"] == held_out]
+
+        n_train_bearings = train_df["bearing_uid"].nunique()
+
+        used_fallback = False
+        if n_train_bearings == 0:
+            train_df = data[data["bearing_uid"] != held_out]
+            n_train_bearings = train_df["bearing_uid"].nunique()
+            used_fallback = True
+
+        metrics = train_and_eval(train_df, test_df, feature_cols)
+        is_outlier = test_df["is_outlier"].iloc[0]
+
+        fallback_note = " (FALLBACK: singleton cluster, used all bearings)" if used_fallback else ""
+        print(f"[{held_out:10s}] cluster={held_out_cluster:10s} "
+              f"(trained on {n_train_bearings} bearings){fallback_note}  "
+              f"MAE={metrics['mae']:6.2f}  RMSE={metrics['rmse']:6.2f}  R2={metrics['r2']:7.4f}")
+
+        results.append({
+            "held_out_bearing": held_out,
+            "degradation_cluster": held_out_cluster,
+            "is_outlier": is_outlier,
+            "n_train_bearings": n_train_bearings,
+            "used_fallback": used_fallback,
+            "mae": metrics["mae"],
+            "rmse": metrics["rmse"],
+            "r2": metrics["r2"],
+        })
+
+    return pd.DataFrame(results)
+
+
+def print_summary(results: pd.DataFrame, label: str):
+    print(f"\n=== {label}: overall summary ===")
+    print(f"Mean MAE:  {results['mae'].mean():.3f}  (std: {results['mae'].std():.3f})")
+    print(f"Mean RMSE: {results['rmse'].mean():.3f}  (std: {results['rmse'].std():.3f})")
+    print(f"Mean R2:   {results['r2'].mean():.4f}  (std: {results['r2'].std():.4f})")
+
+    group_col = "degradation_profile" if "degradation_profile" in results.columns else "degradation_cluster"
+
+    print(f"\n=== {label}: breakdown by {group_col} ===")
+    print(results.groupby(group_col)[["mae", "rmse", "r2"]].agg(["mean", "std"]))
+
+    print(f"\n=== {label}: breakdown by is_outlier ===")
+    print(results.groupby("is_outlier")[["mae", "rmse", "r2"]].agg(["mean", "std"]))
+
+
+def main():
+    print(f"Loading features from {FEATURES_CSV} ...")
+    data = load_data(FEATURES_CSV)
+    print(f"Loaded {len(data)} rows across {data['bearing_uid'].nunique()} bearings.\n")
+
+    feature_cols = [c for c in data.columns if c not in NON_FEATURE_COLS]
+
+    print("############################################")
+    print("# MODE 1: Standard global LOBO (one model)")
+    print("############################################\n")
+    global_results = leave_one_bearing_out_cv(data, feature_cols)
+    print_summary(global_results, "Global LOBO")
+
+    print("\n\n############################################")
+    print("# MODE 2: Cluster-aware LOBO (per-cluster models)")
+    print("############################################\n")
+    cluster_results = cluster_aware_lobo(data, feature_cols)
+    print_summary(cluster_results, "Cluster-aware LOBO")
+
+    print("\n\n############################################")
+    print("# Comparison: does cluster-aware training help?")
+    print("############################################")
+    comparison = global_results[["held_out_bearing", "r2"]].merge(
+        cluster_results[["held_out_bearing", "r2"]],
+        on="held_out_bearing", suffixes=("_global", "_cluster_aware")
+    )
+    comparison["r2_improvement"] = comparison["r2_cluster_aware"] - comparison["r2_global"]
+    print(comparison.to_string(index=False))
+    print(f"\nMean R2 improvement from cluster-aware training: {comparison['r2_improvement'].mean():.4f}")
+
+    # Feature importances from a model trained on all data (inspection only, not a valid eval)
+    print("\n=== Feature importances (model trained on all bearings, all data) ===")
+    X_all, y_all = data[feature_cols], data["rul"]
+    scaler = StandardScaler()
+    X_all_scaled = scaler.fit_transform(X_all)
+    final_model = RandomForestRegressor(**RF_PARAMS)
+    final_model.fit(X_all_scaled, y_all)
+    importances = pd.Series(final_model.feature_importances_, index=feature_cols)
     print(importances.sort_values(ascending=False).head(10))
+
 
 if __name__ == "__main__":
     main()

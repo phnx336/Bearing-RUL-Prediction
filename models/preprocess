@@ -1,3 +1,27 @@
+"""
+preprocess.py
+
+Preprocess XJTU-SY .npy raw signal arrays into a feature table CSV.
+
+Only "plain-numbered" bearing files (e.g. xtr1_1, xte1_3) are used.
+The "b"-prefixed files were found to be concatenations of the plain-numbered
+bearings themselves (verified via RUL jump-point analysis) — including direct
+copies of the test bearings. They are excluded entirely to avoid train/test
+leakage.
+
+Each x*.npy file has shape (n_snapshots, 32768, 2):
+  - n_snapshots: number of vibration recordings over the bearing's life
+  - 32768: raw samples per recording
+  - 2: channels (horizontal, vertical)
+
+Each matching y*.npy holds per-snapshot RUL (%) labels, shape (n_snapshots, 1).
+
+After feature extraction, bearings are profiled by their mean kurtosis,
+crest factor, and freq_mean (indicators of impulsive vs. smooth degradation
+behavior), flagged as statistical outliers relative to their condition-mates,
+and grouped via k-means clustering into degradation "types" that cut across
+operating conditions.
+"""
 
 import os
 import re
@@ -5,19 +29,43 @@ import numpy as np
 import pandas as pd
 from scipy.stats import kurtosis, skew
 from scipy.fft import fft
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler as SkScaler
+
+# -----------------------------
+# CONFIG
+# -----------------------------
 RAW_ROOT = r"A:\Coding\Bearing-RUL-Prediction\data\RAW\XJTU-SY"
 OUTPUT_CSV = r"A:\Coding\Bearing-RUL-Prediction\data\PROCESSED\xjtu_sy_features.csv"
+BEARING_PROFILE_CSV = r"A:\Coding\Bearing-RUL-Prediction\data\PROCESSED\bearing_profiles.csv"
 os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-SAMPLING_RATE = 25600 
+
+SAMPLING_RATE = 25600  # Hz, XJTU-SY spec
+
+# Outlier detection: how many std deviations from the condition-group mean
+# counts as an outlier, applied per profiling metric.
+OUTLIER_Z_THRESHOLD = 1.5
+
+# k-means clustering config
+N_CLUSTERS = 2 # start small given only 10 bearings; tune based on elbow plot if desired
+
+# Metrics used to profile each bearing's degradation "shape" (not RUL itself)
+PROFILE_METRICS = ["h_kurtosis", "v_kurtosis", "h_crest_factor", "v_crest_factor",
+                    "h_freq_mean", "v_freq_mean"]
+
 FNAME_PATTERN = re.compile(
     r"^(?P<var>[xy])"
     r"(?P<split>tr|te)"
     r"(?P<condition>\d)"
-    r"_(?P<bearing>b?\d+)"
+    r"_(?P<bearing>\d+)"       # digits only — excludes b-prefixed files
     r"\.npy$",
     re.IGNORECASE,
 )
 
+
+# -----------------------------
+# STEP 1: INDEX FILES (plain bearings only)
+# -----------------------------
 def parse_filename(fname: str) -> dict | None:
     match = FNAME_PATTERN.match(fname)
     if not match:
@@ -33,17 +81,35 @@ def parse_filename(fname: str) -> dict | None:
 
 def build_file_index(raw_root: str) -> pd.DataFrame:
     rows = []
+    skipped_b_files = []
+
     for fname in sorted(os.listdir(raw_root)):
         if not fname.lower().endswith(".npy"):
             continue
+
         parsed = parse_filename(fname)
         if parsed is None:
-            print(f"Skipping unrecognized file: {fname}")
+            if re.search(r"_b\d+\.npy$", fname, re.IGNORECASE):
+                skipped_b_files.append(fname)
+            else:
+                print(f"Skipping unrecognized file: {fname}")
             continue
+
         rows.append({"filename": fname, "filepath": os.path.join(raw_root, fname), **parsed})
+
+    if skipped_b_files:
+        print(f"Excluded {len(skipped_b_files)} 'b'-prefixed files "
+              f"(known to be concatenated duplicates of plain bearings):")
+        for f in skipped_b_files:
+            print(f"  - {f}")
+        print()
+
     return pd.DataFrame(rows)
 
 
+# -----------------------------
+# STEP 2: FEATURE EXTRACTION PER WINDOW
+# -----------------------------
 def extract_features(signal: np.ndarray) -> dict:
     feats = {}
     feats["mean"] = np.mean(signal)
@@ -68,13 +134,18 @@ def extract_features(signal: np.ndarray) -> dict:
     return feats
 
 
-def process_bearing_file(x_path: str, y_path: str | None) -> pd.DataFrame:
-    X = np.load(x_path, allow_pickle=True)   # shape: (n_snapshots, 32768, 2)
-    n_snapshots = X.shape[0]
+# -----------------------------
+# STEP 3: BUILD FEATURE TABLE
+# -----------------------------
+def process_bearing_file(x_path: str, y_path: str) -> pd.DataFrame:
+    X = np.load(x_path, allow_pickle=True)
+    y = np.load(y_path, allow_pickle=True).reshape(-1)
 
-    y = None
-    if y_path is not None and os.path.exists(y_path):
-        y = np.load(y_path, allow_pickle=True).reshape(-1)  # flatten (n,1) -> (n,)
+    n_snapshots = X.shape[0]
+    if len(y) != n_snapshots:
+        print(f"  WARNING: length mismatch for {x_path} "
+              f"(X has {n_snapshots}, y has {len(y)}) — truncating to shorter length")
+        n_snapshots = min(n_snapshots, len(y))
 
     rows = []
     for idx in range(n_snapshots):
@@ -84,13 +155,7 @@ def process_bearing_file(x_path: str, y_path: str | None) -> pd.DataFrame:
         h_feats = {f"h_{k}": v for k, v in extract_features(h_signal).items()}
         v_feats = {f"v_{k}": v for k, v in extract_features(v_signal).items()}
 
-        if y is not None and idx < len(y):
-            rul_label = y[idx]
-        else:
-            # fallback: linear degradation assumption
-            rul_label = 100.0 * (1 - idx / (n_snapshots - 1)) if n_snapshots > 1 else 0.0
-
-        rows.append({**h_feats, **v_feats, "rul": rul_label, "snapshot_idx": idx})
+        rows.append({**h_feats, **v_feats, "rul": y[idx], "snapshot_idx": idx})
 
     return pd.DataFrame(rows)
 
@@ -106,34 +171,111 @@ def build_dataset(file_index: pd.DataFrame) -> pd.DataFrame:
             (y_files["condition"] == row["condition"]) &
             (y_files["bearing"] == row["bearing"])
         ]
-        y_path = match.iloc[0]["filepath"] if not match.empty else None
+        if match.empty:
+            print(f"  WARNING: no matching y-file found for {row['filename']} — skipping")
+            continue
+        y_path = match.iloc[0]["filepath"]
 
-        print(f"Processing {row['filename']} "
-              f"(y match: {match.iloc[0]['filename'] if not match.empty else 'NONE, using fallback RUL'})")
+        print(f"Processing {row['filename']} (y match: {match.iloc[0]['filename']})")
 
         df = process_bearing_file(row["filepath"], y_path)
         df["split"] = row["split"]
         df["condition"] = row["condition"]
         df["bearing"] = row["bearing"]
+        df["bearing_uid"] = f"cond{row['condition']}_b{row['bearing']}"
         all_rows.append(df)
 
     return pd.concat(all_rows, ignore_index=True)
 
 
+# -----------------------------
+# STEP 4: BEARING PROFILING + OUTLIER DETECTION + K-MEANS CLUSTERING
+# -----------------------------
+def profile_bearings(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes per-bearing mean values for key degradation-shape metrics,
+    flags statistical outliers within each condition group, and clusters
+    bearings via k-means on their profile metrics.
+
+    This does NOT use rul/snapshot_idx — it profiles the *character* of
+    the vibration signal itself, independent of where in its life a
+    bearing is.
+    """
+    bearing_means = data.groupby(["condition", "bearing_uid"])[PROFILE_METRICS].mean().reset_index()
+
+    # --- outlier detection (per condition group, z-score based) ---
+    outlier_flags = []
+    for condition, group in bearing_means.groupby("condition"):
+        z_scores = (group[PROFILE_METRICS] - group[PROFILE_METRICS].mean()) / group[PROFILE_METRICS].std()
+        is_outlier = (z_scores.abs() > OUTLIER_Z_THRESHOLD).any(axis=1)
+        outlying_metrics = z_scores.abs().gt(OUTLIER_Z_THRESHOLD).apply(
+            lambda row: ", ".join(row.index[row]), axis=1
+        )
+        for i, row in group.iterrows():
+            outlier_flags.append({
+                "bearing_uid": row["bearing_uid"],
+                "condition": condition,
+                "is_outlier": bool(is_outlier.loc[i]),
+                "outlying_metrics": outlying_metrics.loc[i] if is_outlier.loc[i] else "",
+            })
+    outlier_df = pd.DataFrame(outlier_flags)
+    bearing_profile = bearing_means.merge(outlier_df, on=["condition", "bearing_uid"])
+
+    # --- k-means clustering across ALL bearings (cuts across conditions,
+    #     since we want to find degradation "types" independent of operating condition) ---
+    scaler = SkScaler()
+    X_profile = scaler.fit_transform(bearing_profile[PROFILE_METRICS])
+
+    kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(X_profile)
+
+    bearing_profile["degradation_cluster"] = cluster_labels
+
+    # Relabel clusters by mean kurtosis rank for interpretability
+    # (cluster_0 = lowest kurtosis/smoothest, higher numbers = more impulsive)
+    cluster_kurtosis_rank = (
+        bearing_profile.groupby("degradation_cluster")["h_kurtosis"]
+        .mean()
+        .sort_values()
+        .index
+    )
+    label_map = {cluster_id: f"cluster_{rank}" for rank, cluster_id in enumerate(cluster_kurtosis_rank)}
+    bearing_profile["degradation_profile"] = bearing_profile["degradation_cluster"].map(label_map)
+
+    return bearing_profile
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
     print(f"Scanning {RAW_ROOT} ...")
     file_index = build_file_index(RAW_ROOT)
-    print(f"Found {len(file_index)} recognized files "
+    print(f"Found {len(file_index)} recognized plain-numbered files "
           f"({(file_index['variable'] == 'X').sum()} X-files, "
           f"{(file_index['variable'] == 'y').sum()} y-files)\n")
 
     dataset = build_dataset(file_index)
+
+    print("\nProfiling bearings (outlier detection + k-means clustering)...")
+    bearing_profile = profile_bearings(dataset)
+
+    # Merge outlier/profile info back into the main feature table
+    dataset = dataset.merge(
+        bearing_profile[["bearing_uid", "is_outlier", "outlying_metrics", "degradation_profile"]],
+        on="bearing_uid", how="left"
+    )
+
     dataset.to_csv(OUTPUT_CSV, index=False)
+    bearing_profile.to_csv(BEARING_PROFILE_CSV, index=False)
 
     print(f"\nDone. Feature dataset saved to: {OUTPUT_CSV}")
+    print(f"Bearing profile summary saved to: {BEARING_PROFILE_CSV}")
     print(f"Shape: {dataset.shape}")
-    print(f"Bearings included: {sorted(dataset['bearing'].unique())}")
-    print(f"Split counts:\n{dataset.groupby(['split', 'bearing']).size()}")
+    print(f"\n=== Bearing Profile Summary ===")
+    print(bearing_profile[["bearing_uid", "condition", "degradation_profile",
+                            "is_outlier", "outlying_metrics"]].to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
